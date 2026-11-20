@@ -33,18 +33,91 @@ function CandleChart({symbol,tf,onTf,onStream}:{symbol:string;tf:TF;onTf:(t:TF)=
  const realVol=bars.some(b=>b.volume>0);
  useEffect(()=>{if(!host.current||chart.current)return;const c=createChart(host.current,{width:host.current.clientWidth,height:390,layout:{background:{type:ColorType.Solid,color:"#0a1220"},textColor:"#91a4bd",fontFamily:"Inter,system-ui,sans-serif"},grid:{vertLines:{color:"#172438"},horzLines:{color:"#172438"}},crosshair:{mode:CrosshairMode.Normal},rightPriceScale:{borderColor:"#22334a"},timeScale:{borderColor:"#22334a",timeVisible:true,secondsVisible:tf==="1s"}});chart.current=c;candle.current=c.addCandlestickSeries({upColor:"#20c997",downColor:"#f05d6c",borderUpColor:"#20c997",borderDownColor:"#f05d6c",wickUpColor:"#20c997",wickDownColor:"#f05d6c"});vol.current=c.addHistogramSeries({priceFormat:{type:"volume"},priceScaleId:"volume",lastValueVisible:false,priceLineVisible:false});c.priceScale("volume").applyOptions({scaleMargins:{top:.82,bottom:0}});e20.current=c.addLineSeries({color:"#f6bd60",lineWidth:2,title:"EMA 20",priceLineVisible:false,lastValueVisible:false});s50.current=c.addLineSeries({color:"#65a9ff",lineWidth:2,title:"SMA 50",priceLineVisible:false,lastValueVisible:false});bu.current=c.addLineSeries({color:"#b48ead",lineWidth:1,lineStyle:2,priceLineVisible:false,lastValueVisible:false});bl.current=c.addLineSeries({color:"#b48ead",lineWidth:1,lineStyle:2,priceLineVisible:false,lastValueVisible:false});bm.current=c.addLineSeries({color:"#8d79b8",lineWidth:1,priceLineVisible:false,lastValueVisible:false});const ro=new ResizeObserver(es=>{const w=es[0]?.contentRect.width;if(w)chart.current?.applyOptions({width:w});});ro.observe(host.current);return()=>{ro.disconnect();c.remove();chart.current=null;};},[]);
  useEffect(()=>{const c=chart.current;if(!c)return;const cd=bars.map(b=>({time:b.time as any,open:b.open,high:b.high,low:b.low,close:b.close}));const vd=bars.map(b=>({time:b.time as any,value:b.volume>0?b.volume:b.tickVolume,color:b.close>=b.open?"rgba(32,201,151,.38)":"rgba(240,93,108,.38)"}));const line=(a:number[])=>bars.map((b,i)=>({time:b.time as any,value:a[i]})).filter(p=>Number.isFinite(p.value));candle.current.setData(cd);vol.current.setData(vd);e20.current.setData(ind.ema?line(ev):[]);s50.current.setData(ind.sma?line(sv):[]);bu.current.setData(ind.bb?line(bands.u):[]);bl.current.setData(ind.bb?line(bands.l):[]);bm.current.setData(ind.bb?line(bands.m):[]);},[bars,ind,ev,sv,bands]);
- useEffect(()=>{let alive=true,conn:HubConnection|null=null;const sym=alias(symbol);dataRef.current=[];setBars([]);setError("");setLoading(tf!=="1s");setStatus("CONNECTING");onStream("CONNECTING");
- async function history(){if(tf==="1s"){setLoading(false);return;}try{const r=await fetch("/api/candles/"+symbol+"?interval="+API_TF[tf]+"&limit=300",{cache:"no-store"});const d=await r.json();if(!r.ok)throw new Error(d.error||"Candle history unavailable");const a:Bar[]=(d.bars||[]).map((b:any)=>({time:Math.floor(Date.parse(b.openTime)/1000),open:Number(b.open),high:Number(b.high),low:Number(b.low),close:Number(b.close),volume:Number(b.volume||0),tickVolume:Number(b.tickVolume||0)})).filter((b:Bar)=>Number.isFinite(b.time)&&Number.isFinite(b.close)).sort((x:Bar,y:Bar)=>x.time-y.time);if(alive){dataRef.current=a;setBars(a);if(!a.length)setError("No historical bars returned for this symbol.");}}catch(e){if(alive)setError(e instanceof Error?e.message:"Unable to load candles");}finally{if(alive)setLoading(false);}}
- async function stream(){try{conn=new HubConnectionBuilder().withUrl("https://biquote.io/hubs/tick").withAutomaticReconnect().configureLogging(LogLevel.Error).build();conn.on("ReceiveTick",(t:any)=>{if(!alive||(t.symbol&&t.symbol!==sym&&t.symbol!==symbol))return;const bid=Number(t.bid),ask=Number(t.ask),p=Number(t.mid??(bid>0&&ask>0?(bid+ask)/2:t.price??t.last));if(!Number.isFinite(p)||p<=0)return;const sec=SECS[tf],stamp=timeOf(t.timestamp??t.time),bucket=Math.floor(stamp/sec)*sec,old=dataRef.current,last=old[old.length-1];let next:Bar[];if(!last||bucket>last.time)next=[...old,{time:bucket,open:p,high:p,low:p,close:p,volume:0,tickVolume:1}].slice(-500);else if(bucket===last.time)next=[...old.slice(0,-1),{...last,high:Math.max(last.high,p),low:Math.min(last.low,p),close:p,tickVolume:last.tickVolume+1}];else return;dataRef.current=next;setBars(next);});conn.onreconnecting(()=>{if(alive){setStatus("RECONNECTING");onStream("RECONNECTING");}});conn.onreconnected(async()=>{if(alive){await conn?.invoke("Subscribe",[sym]);setStatus("STREAMING");onStream("STREAMING");}});await conn.start();if(!alive)return;await conn.invoke("Subscribe",[sym]);setStatus("STREAMING");onStream("STREAMING");}catch{if(alive){setStatus("OFFLINE");onStream("OFFLINE");setError(old=>old||"WebSocket unavailable; historical data may still load.");}}}
- history();stream();return()=>{alive=false;if(conn)conn.invoke("Unsubscribe",[sym]).catch(()=>undefined).finally(()=>conn?.stop().catch(()=>undefined));};
+ useEffect(()=>{
+  let alive=true;
+  let timer:ReturnType<typeof setTimeout>|null=null;
+  let lastTickKey="";
+  const sym=alias(symbol);
+  dataRef.current=[];
+  setBars([]);
+  setError("");
+  setLoading(true);
+  setStatus("CONNECTING");
+  onStream("CONNECTING");
+  const addTick=(tick:any)=>{
+   if(!alive||(tick.symbol&&tick.symbol!==sym&&tick.symbol!==symbol))return;
+   const bid=Number(tick.bid),ask=Number(tick.ask);
+   const p=Number(tick.mid??(bid>0&&ask>0?(bid+ask)/2:tick.price??tick.last));
+   if(!Number.isFinite(p)||p<=0)return;
+   const stamp=timeOf(tick.timestamp??tick.time);
+   const key=String(tick.timestamp??stamp)+"|"+p;
+   if(key===lastTickKey)return;
+   lastTickKey=key;
+   const sec=SECS[tf],bucket=Math.floor(stamp/sec)*sec,old=dataRef.current,last=old[old.length-1];
+   let next:Bar[];
+   if(!last||bucket>last.time)next=[...old,{time:bucket,open:p,high:p,low:p,close:p,volume:0,tickVolume:1}].slice(-500);
+   else if(bucket===last.time)next=[...old.slice(0,-1),{...last,high:Math.max(last.high,p),low:Math.min(last.low,p),close:p,tickVolume:last.tickVolume+1}];
+   else return;
+   dataRef.current=next;
+   setBars(next);
+  };
+  const seedSeconds=(ticks:any[])=>{
+   const bySecond=new Map<number,Bar>();
+   ticks.forEach(t=>{
+    const p=Number(t.mid??(Number(t.bid)>0&&Number(t.ask)>0?(Number(t.bid)+Number(t.ask))/2:t.price??t.last));
+    if(!Number.isFinite(p)||p<=0)return;
+    const stamp=timeOf(t.timestamp??t.time),bucket=stamp;
+    const found=bySecond.get(bucket);
+    if(!found)bySecond.set(bucket,{time:bucket,open:p,high:p,low:p,close:p,volume:0,tickVolume:1});
+    else{found.high=Math.max(found.high,p);found.low=Math.min(found.low,p);found.close=p;found.tickVolume+=1;}
+   });
+   const seeded=Array.from(bySecond.values()).sort((a,b)=>a.time-b.time).slice(-500);
+   dataRef.current=seeded;
+   setBars(seeded);
+  };
+  const load=async(includeHistory:boolean)=>{
+   const response=await fetch("/api/ticks/"+symbol+"?history="+(includeHistory?"1":"0"),{cache:"no-store"});
+   const payload=await response.json();
+   if(!response.ok)throw new Error(payload.error||"Tick snapshot unavailable");
+   if(includeHistory&&tf==="1s")seedSeconds(payload.ticks||[]);
+   if(payload.latest)addTick(payload.latest);
+  };
+  const poll=async()=>{
+   if(!alive)return;
+   try{
+    await load(false);
+    if(alive){setStatus("POLLING");onStream("POLLING");}
+   }catch(e){
+    if(alive){setStatus("DEGRADED");onStream("DEGRADED");setError(e instanceof Error?e.message:"Market tick request failed");}
+   }finally{
+    if(alive)timer=setTimeout(poll,1000);
+   }
+  };
+  (async()=>{
+   try{
+    if(tf!=="1s"){
+     const response=await fetch("/api/candles/"+symbol+"?interval="+API_TF[tf]+"&limit=300",{cache:"no-store"});
+     const payload=await response.json();
+     if(!response.ok)throw new Error(payload.error||"Candle history unavailable");
+     const parsed:Bar[]=(payload.bars||[]).map((b:any)=>({time:Math.floor(Date.parse(b.openTime)/1000),open:Number(b.open),high:Number(b.high),low:Number(b.low),close:Number(b.close),volume:Number(b.volume||0),tickVolume:Number(b.tickVolume||0)})).filter((b:Bar)=>Number.isFinite(b.time)&&Number.isFinite(b.close)).sort((a:Bar,b:Bar)=>a.time-b.time);
+     if(alive){dataRef.current=parsed;setBars(parsed);}
+    }
+    await load(tf==="1s");
+    if(alive){setLoading(false);setStatus("POLLING");onStream("POLLING");}
+   }catch(e){
+    if(alive){setLoading(false);setStatus("DEGRADED");onStream("DEGRADED");setError(e instanceof Error?e.message:"Unable to load market data");}
+   }
+   poll();
+  })();
+  return()=>{alive=false;if(timer)clearTimeout(timer);};
  },[symbol,tf,onStream]);
  const lineToggle=(key:keyof typeof ind)=>setInd(v=>({...v,[key]:!v[key]}));
  return <div className="chart-shell">
-  <div className="chart-toolbar"><div className="chart-toolbar-left"><b className="symbol-big">{symbol}</b><span className={"stream-pill "+(status==="STREAMING"?"good":status==="RECONNECTING"?"warn":"muted")}><i/>{status}</span>{tf==="1s"&&<small className="micro-note">1-second candles aggregated from live ticks</small>}</div><div className="timeframes">{TFS.map(t=><button key={t} className={tf===t?"active":""} onClick={()=>onTf(t)}>{t.toUpperCase()}</button>)}</div></div>
+  <div className="chart-toolbar"><div className="chart-toolbar-left"><b className="symbol-big">{symbol}</b><span className={"stream-pill "+(status==="STREAMING"?"good":status==="RECONNECTING"?"warn":"muted")}><i/>{status}</span>{tf==="1s"&&<small className="micro-note">1-second bars aggregated from provider tick history</small>}</div><div className="timeframes">{TFS.map(t=><button key={t} className={tf===t?"active":""} onClick={()=>onTf(t)}>{t.toUpperCase()}</button>)}</div></div>
   <div className="indicator-row"><button className={ind.ema?"indicator active":"indicator"} onClick={()=>lineToggle("ema")}>EMA 20</button><button className={ind.sma?"indicator active":"indicator"} onClick={()=>lineToggle("sma")}>SMA 50</button><button className={ind.bb?"indicator active":"indicator"} onClick={()=>lineToggle("bb")}>Bollinger</button><i className="indicator-divider"/><span className="indicator-value">RSI(14) <b>{Number.isFinite(rv)?num(rv,1):"—"}</b></span><span className="indicator-value">MACD <b>{Number.isFinite(mv.line)?num(mv.line,4):"—"}</b></span><span className="indicator-value">Signal <b>{Number.isFinite(mv.signal)?num(mv.signal,4):"—"}</b></span></div>
   <div className="chart-meta"><span>{bars.length} candles loaded</span><span>{realVol?"Provider volume":"Tick count only · traded volume not supplied"}</span><span>Biquote MT5 feed</span></div>
   <div className="chart-stage"><div ref={host} className="chart-canvas"/>{loading&&<div className="chart-overlay">Loading historical candles…</div>}{!loading&&tf==="1s"&&!bars.length&&<div className="chart-overlay">Waiting for first live tick to build 1-second candles…</div>}{!loading&&error&&<div className="chart-error">{error}</div>}</div>
-  <div className="chart-footer"><span><i className="dot green"/>Up candle</span><span><i className="dot red"/>Down candle</span><span>OHLC based on mid-price</span></div>
+  <div className="chart-footer"><span><i className="dot green"/>Up candle</span><span><i className="dot red"/>Down candle</span><span>Mid-price snapshots · provider timestamps</span></div>
  </div>;
 }
 
@@ -59,7 +132,7 @@ export default function Home(){
  <div className="app-layout"><aside className={"sidebar "+(mobile?"open":"")}><div className="nav-label">WORKSPACE</div>{["Terminal","Challenges","My Account","Rules"].map(x=><button key={x} className={"nav-item "+(tab===x?"selected":"")} onClick={()=>{setTab(x);setMobile(false);}}><span className="nav-icon">{x==="Terminal"?"⌁":x==="Challenges"?"◇":x==="My Account"?"◎":"≡"}</span>{x}{x==="Terminal"&&<span className="nav-live">LIVE</span>}</button>)}<div className="sidebar-bottom"><div className="side-card"><div className="side-card-kicker">MARKET FEED</div><strong>{market}</strong><small>Biquote · MetaTrader 5</small><small>Indicative third-party quotes</small></div><div className="sidebar-version">AGMT APEX · BUILD 02</div></div></aside>
  <section className="main-content">
  {tab==="Terminal"&&<><div className="page-heading"><div><div className="eyebrow">MARKET WORKSPACE / {group.toUpperCase()}</div><h1>Trading Terminal</h1><p>Analyse global markets with live indicative quotes and demo practice tools.</p></div><div className="heading-right"><span className="market-live"><i/>MARKET DATA {market}</span><small>Market watch refreshes every ~1.5s</small></div></div>
- <div className="market-strip"><div><span>SELECTED INSTRUMENT</span><strong>{selected}</strong><small>{quote?.marketState==="closed"?"MARKET CLOSED · LAST PRICE":"INDICATIVE MT5 QUOTE"}</small></div><div><span>MID PRICE</span><strong>{price(selected,quote?.mid)}</strong><small className={(quote?.dayDiffPercent||0)>=0?"positive":"negative"}>{quote?.dayDiffPercent===undefined?"—":(quote.dayDiffPercent>=0?"+":"")+num(quote.dayDiffPercent,2)+"% today"}</small></div><div><span>BID / ASK</span><strong>{price(selected,quote?.bid)} / {price(selected,quote?.ask)}</strong><small>Spread {num(quote?.spread,5)}</small></div><div><span>CHART STREAM</span><strong className="stream-text">{stream}</strong><small>SignalR WebSocket</small></div></div>
+ <div className="market-strip"><div><span>SELECTED INSTRUMENT</span><strong>{selected}</strong><small>{quote?.marketState==="closed"?"MARKET CLOSED · LAST PRICE":"INDICATIVE MT5 QUOTE"}</small></div><div><span>MID PRICE</span><strong>{price(selected,quote?.mid)}</strong><small className={(quote?.dayDiffPercent||0)>=0?"positive":"negative"}>{quote?.dayDiffPercent===undefined?"—":(quote.dayDiffPercent>=0?"+":"")+num(quote.dayDiffPercent,2)+"% today"}</small></div><div><span>BID / ASK</span><strong>{price(selected,quote?.bid)} / {price(selected,quote?.ask)}</strong><small>Spread {num(quote?.spread,5)}</small></div><div><span>CHART STREAM</span><strong className="stream-text">{stream}</strong><small>REST snapshot polling · ~1s</small></div></div>
  <div className="terminal-grid"><div className="left-column"><div className="panel market-watch"><div className="panel-head"><div><h2>Market Watch</h2><small>16 instruments · select to chart</small></div><span className="live-label"><i/>LIVE</span></div><div className="watch-groups">{GROUPS.map(([g,items])=><div key={g}><div className="watch-group-title">{g}</div>{items.map(s=>{const q=quotes[s];return <button key={s} className={"watch-row "+(selected===s?"active":"")} onClick={()=>setSelected(s)}><span className="watch-symbol">{s}</span><span className="watch-price">{price(s,q?.mid)}</span><span className={(q?.dayDiffPercent||0)>=0?"positive":"negative"}>{q?.dayDiffPercent===undefined?"—":(q.dayDiffPercent>=0?"+":"")+num(q.dayDiffPercent,2)+"%"}</span></button>;})}</div>)}</div></div>
  <div className="panel order-panel"><div className="panel-head"><div><h2>Demo Order Ticket</h2><small>Practice only · no broker execution</small></div><span className="demo-tag">DEMO</span></div><div className="order-symbol"><span>{selected}</span><strong>{price(selected,quote?.mid)}</strong></div><div className="side-switch"><button className={side==="BUY"?"buy selected":"buy"} onClick={()=>setSide("BUY")}>BUY</button><button className={side==="SELL"?"sell selected":"sell"} onClick={()=>setSide("SELL")}>SELL</button></div><label className="field-label">VOLUME (LOTS)</label><input value={lots} onChange={e=>setLots(e.target.value)} inputMode="decimal"/><button className="place-order" onClick={place}>Place demo {side}</button><p className="fine-print">Orders remain in this browser session and are not sent to a broker.</p>{notice&&<div className="notice">{notice}</div>}</div></div>
  <div className="right-column"><div className="panel chart-panel"><CandleChart symbol={selected} tf={tf} onTf={setTf} onStream={streamCb}/></div><div className="panel recent-orders"><div className="panel-head"><div><h2>Recent Demo Orders</h2><small>Local practice activity</small></div><span className="order-count">{orders.length} orders</span></div>{!orders.length?<div className="empty-state">No demo orders yet. Choose BUY or SELL to practise.</div>:<div className="order-table"><div className="order-table-head"><span>Side / Symbol</span><span>Lots</span><span>Entry</span><span>Time</span></div>{orders.slice(0,6).map(o=><div className="order-table-row" key={o.id}><span className={o.side==="BUY"?"positive":"negative"}>{o.side} · {o.symbol}</span><span>{o.lots}</span><span>{price(o.symbol,o.price)}</span><span>{o.time}</span></div>)}</div>}</div></div></div></>}
